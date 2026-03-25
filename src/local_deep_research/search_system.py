@@ -7,6 +7,7 @@ import textwrap
 import traceback
 from datetime import datetime
 from typing import Dict, List, Tuple
+
 from .config import (
     settings,
     get_claude_openai,
@@ -16,10 +17,7 @@ from .config import (
     get_gpt4_1_mini,
     get_local_model,
 )
-
 from .connect_mcp import OrigeneMCPToolClient, mcp_servers
-
-# Import utilities
 from .search_system_support import (
     compress_all_llm,
     extract_and_convert_list,
@@ -51,9 +49,7 @@ logger.addHandler(file_handler)
 
 
 def remove_think_tags(text: str) -> str:
-    """
-    Robustly remove <think> tags from model output.
-    """
+    """Robustly remove <think> tags from model output."""
     if not text:
         return ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -63,17 +59,19 @@ def remove_think_tags(text: str) -> str:
 
 
 class ReferencePool:
-    """Reference pool for citations."""
-    def __init__(self) -> None:
+    """Reference pool for citations, supporting baseline offset."""
+    def __init__(self, baseline_max_index: int = 0) -> None:
         self.pool: List[SourcesReference] = []
         self.link2idx: dict[str, int] = {}
+        self.base_idx = baseline_max_index # 记录 graph-ec 传来的最大文献序号
 
     def add(self, title: str, citation: str, link: str) -> int:
         if not link:
             return -1
         if link in self.link2idx:
             return self.link2idx[link]
-        idx = len(self.pool) + 1
+        # 新文献从 base_idx + 1 开始接力编号
+        idx = self.base_idx + len(self.pool) + 1
         self.link2idx[link] = idx
         self.pool.append(
             SourcesReference(title=title or link, subtitle=citation or "", link=link)
@@ -81,8 +79,10 @@ class ReferencePool:
         return idx
     
     def get_ref_by_idx(self, idx: int):
-        if 1 <= idx <= len(self.pool):
-            return self.pool[idx-1]
+        # 换算回本地 pool 的实际索引
+        actual_idx = idx - self.base_idx - 1
+        if 0 <= actual_idx < len(self.pool):
+            return self.pool[actual_idx]
         return None
 
 
@@ -96,8 +96,15 @@ class AdvancedSearchSystem:
         error_log_path: str = "",
         using_model = "deepseek",  
         treatment_context: str = "",
+        structured_task: dict = None, # 接收从 main.py 传来的结构化任务
     ):
-        self.ref_pool = ReferencePool() 
+        self.structured_task = structured_task or {}
+        
+        # 初始化带偏移量的引用池
+        baseline_refs = self.structured_task.get("baseline_references", {})
+        max_idx = baseline_refs.get("max_index", 0)
+        self.ref_pool = ReferencePool(baseline_max_index=max_idx) 
+        
         self.chosen_tools = chosen_tools
         self.is_report = is_report
         self.max_iterations = max_iterations
@@ -139,7 +146,6 @@ class AdvancedSearchSystem:
             self.report_model = get_deepseek_r1()
             
         else:
-            # Default to GPT
             self.model = get_gpt4_1()
             self.reasoning_model = get_gpt4_1()
             self.tool_planning_model = get_gpt4_1()
@@ -173,44 +179,41 @@ class AdvancedSearchSystem:
             logger.error(f"Failed to initialize search system: {e}")
             raise e
 
-    async def _get_follow_up_questions(
-        self, current_knowledge: str, query: str
-    ) -> List[str]:
-        """
-        Generate API-compatible search queries (keywords).
-        """
+    async def _get_follow_up_questions(self, current_knowledge: str, query: str) -> List[str]:
         now = datetime.now().strftime("%Y-%m-%d")
         
+        patient_profile = self.structured_task.get("patient_profile", "")
+        interventions = "\n".join([f"- {i}" for i in self.structured_task.get("proposed_interventions", [])])
+        
         prompt = f"""
-        # Clinical Evidence Validator (Pure API Mode)
+        # Clinical Evidence Coordinator & API Planner
         
-        ## Context
-        - Task: Validate the provided treatment plan against LATEST (2024-Present) official evidence.
-        - Date: {now}
-        - Input Plan/Context: "{self.treatment_context[:2000]}..."
-        - Current Knowledge: {current_knowledge}
+        You are an expert Clinical Decision Support Coordinator. 
+        Your task is to analyze a Chinese clinical case, bridge the language gap, and generate precise English API queries for medical databases.
         
-        ## Your Task
-        Generate exactly {self.questions_per_iteration} specific API queries to verify or formulate the plan.
+        ## 1. Clinical Context (Chinese Input)
+        - **Patient Profile**: {patient_profile}
+        - **Proposed Interventions (Baseline Plan)**: {interventions}
+        - **Current Verification Knowledge**: {current_knowledge}
         
-        ## STRICT QUERY RULES (For APIs)
-        1. **PubMed**: Use **KEYWORDS ONLY**. No "site:" operator.
-           - Bad: "Search for papers about Pembrolizumab survival"
-           - Good: "Pembrolizumab endometrial cancer overall survival 2024"
-        2. **ClinicalTrials.gov**: Use **Condition | Intervention** format.
-           - Bad: "Find trials for..."
-           - Good: "Endometrial Cancer | Lenvatinib"
-        3. **FDA**: Use **Drug Name** only.
-           - Bad: "Is Dostarlimab approved?"
-           - Good: "Dostarlimab"
+        ## 2. 🛑 API KEYWORD OPTIMIZATION STRATEGY (CRITICAL)
+        - **Tier 1: Baseline Drug Optimization (Head-to-Head Comparisons)**
+          Identify toxic legacy drugs in the baseline (e.g., Cisplatin). Use your internal medical knowledge to identify its modern, less toxic alternative (e.g., Carboplatin), and generate a pure keyword query putting them side-by-side.
+          *Rule:* Do NOT use complex tags like [ptyp] or [pdat] here. Just use the core keywords so the engine can find landmark Phase III trials (like GOG 209).
+          *GOOD PubMed Query:* "Endometrial cancer Cisplatin Carboplatin"
+        - **Tier 2: Frontier Exploration (Recent 1-2 Years)**
+          Search for new targeted/immunotherapies based on high-risk factors ONLY IF appropriate for the ADJUVANT setting.
+          *Rule:* You MUST add "2024" or "2025" to filter for the latest breakthroughs.
+          *GOOD PubMed Query:* "Endometrial cancer adjuvant Pembrolizumab 2024"
+        
+        Generate exactly {self.questions_per_iteration} highly targeted API queries.
         
         ## Output Format (JSON)
         {{
-            "thoughts": "Checking standard of care for Stage III.",
-            "strategy": ["Check NCCN via PubMed", "Check Active Trials"],
+            "analysis": "Identify legacy drugs needing comparison, and new targets for exploration.",
             "sub_queries": [
-                "Endometrial cancer stage III adjuvant therapy 2024", 
-                "Endometrial Cancer | Chemotherapy"
+                "Endometrial cancer Cisplatin Carboplatin", 
+                "Endometrial cancer adjuvant Pembrolizumab 2024"
             ]
         }}
         """
@@ -243,12 +246,10 @@ class AdvancedSearchSystem:
         current_iteration: int,
         max_iterations: int,
     ) -> str:
-        """
-        Synthesize API findings.
-        """
+        """Synthesize API findings."""
         existing_refs = [
             f"[{idx}] {ref.link} — {ref.title}"
-            for idx, ref in enumerate(self.ref_pool.pool, 1)
+            for idx, ref in enumerate(self.ref_pool.pool, self.ref_pool.base_idx + 1)
         ]
         refs_block = "\n".join(existing_refs) or "*None yet*"
 
@@ -257,9 +258,6 @@ class AdvancedSearchSystem:
         
         Validating clinical plan using **OFFICIAL API DATA** (PubMed/FDA/CT.gov).
         
-        ## Input Plan
-        {self.treatment_context}
-        
         ## Verified API Data
         {current_knowledge}
         
@@ -267,7 +265,7 @@ class AdvancedSearchSystem:
         {refs_block}
         
         ## Instructions
-        1. **Validate**: Does 2024-Present evidence support the plan?
+        1. **Validate**: Does 2024-Present evidence support the focus areas?
         2. **Update**: Identify newer trials/approvals.
         3. **Detail**: Note specific regimens (Drug/Dose) found in evidence.
         
@@ -279,9 +277,6 @@ class AdvancedSearchSystem:
         
         ## Missing Data
         [What couldn't be verified?]
-
-        ## References
-        [List [^^n] citations strictly]
         """)
 
         try:
@@ -296,142 +291,135 @@ class AdvancedSearchSystem:
 
     def _reindex_references(self, content: str) -> Tuple[str, str]:
         """
-        Extract citations from text, supporting various formats like [^^1], [^^1, ^^2], [^^1, 2].
-        Reindex them starting from 1 and generate a clean reference list.
+        重排引用序号，并生成与 graph-ec 完全一致的参考文献格式。
+        核心逻辑：根据正文实际引用的文献，在 graph-ec 的最大序号之后【连续且不跳号】地重新编号。
         """
-        # 1. 更加通用的正则：捕获 [ ... ] 中包含 ^^ 的内容
-        # 允许 [^^1], [^^1, ^^2], [^^1, 2], [^^1,2]
-        matches_iter = re.finditer(r"\[(.*?)\]", content)
+        # 1. 匹配括号内全都是数字、逗号、空格或^符号的字符串 (如 [10], [10, 12], [^^10])
+        matches_iter = re.finditer(r"\[([\d\s\^\,]+)\]", content)
         
         all_cited_ids = []
-        valid_matches = [] # 存储合法的引用对象，用于后续替换
-        
         for m in matches_iter:
             inner_text = m.group(1)
-            # 只有当括号内包含 '^^' 时才认为是引用标记
-            if "^^" in inner_text:
-                # 提取里面的所有数字，忽略 ^^, 逗号, 空格
-                # 例如 "doc ^^4, ^^9" -> [4, 9]
-                ids = [int(s) for s in re.findall(r"\d+", inner_text)]
-                if ids:
-                    all_cited_ids.extend(ids)
-                    valid_matches.append(m.group(0)) # 保存原始字符串用于正则替换
+            ids = [int(s) for s in re.findall(r"\d+", inner_text)]
+            if ids:
+                all_cited_ids.extend(ids)
 
-        # 2. 建立映射：原始ID -> 新序号 (保持出现顺序且去重)
+        # 2. 去重，保留正文中实际引用到的文献顺序
         unique_cited_ids = list(dict.fromkeys(all_cited_ids))
         
         old_id_to_new_id = {}
         new_references_list = []
-        current_new_id = 1
+        
+        # 动态分配连续的新序号，从 graph-ec 的最大序号之后开始接力
+        current_new_id = self.ref_pool.base_idx + 1 
         
         for old_id in unique_cited_ids:
             ref_obj = self.ref_pool.get_ref_by_idx(old_id)
             if ref_obj:
                 old_id_to_new_id[old_id] = current_new_id
-                new_references_list.append(ref_obj)
+                new_references_list.append((current_new_id, ref_obj))
                 current_new_id += 1
         
-        # 3. 替换正文中的引用
+        # 3. 替换正文中的旧序号为新分配的连续序号
         def replace_match(match):
             inner_text = match.group(1)
-            if "^^" not in inner_text:
-                return match.group(0) # 不是我们的引用格式，原样返回
-            
-            # 提取数字
             old_ids = [int(s) for s in re.findall(r"\d+", inner_text)]
-            
-            new_ids_str = ""
+            if not old_ids:
+                return match.group(0)
+                
+            new_ids = []
             for oid in old_ids:
                 if oid in old_id_to_new_id:
-                    # 使用临时标记 [^^^n] 防止多次替换冲突
-                    new_ids_str += f"[^^^{old_id_to_new_id[oid]}]"
+                    new_ids.append(str(old_id_to_new_id[oid]))
+                else:
+                    new_ids.append(str(oid)) 
             
-            return new_ids_str if new_ids_str else match.group(0)
+            if new_ids:
+                return f"[{', '.join(new_ids)}]"
+            return match.group(0)
             
-        # 使用更宽泛的正则进行替换
-        new_content = re.sub(r"\[(.*?)\]", replace_match, content)
-        new_content = new_content.replace("[^^^", "[")
+        new_content = re.sub(r"\[([\d\s\^\,]+)\]", replace_match, content)
         
-        # 4. 生成参考文献列表文本
-        refs_text = "\n\n**六、参考文献 (References)**\n"
-        if not new_references_list:
-            refs_text += "*No references cited in the report.*\n"
-        else:
-            for i, ref in enumerate(new_references_list, 1):
+        # 4. 生成完全模仿 graph-ec 排版格式的文本
+        refs_text = "\n==================================================\n" 
+        
+        if new_references_list:
+            for new_idx, ref in new_references_list:
                 title = ref.title.replace("\n", " ").strip() if ref.title else ref.link
                 if len(title) > 300: 
                     title = title[:300] + "..."
-                # 生成 Markdown 链接格式 [1] [Title](Link)
-                refs_text += f"[{i}] [{title}]({ref.link})\n"
+                
+                pmid_val = "Unknown"
+                if "pubmed.ncbi.nlm.nih.gov/" in ref.link:
+                    pmid_match = re.search(r'pubmed\.ncbi\.nlm\.nih\.gov/(\d+)', ref.link)
+                    if pmid_match:
+                        pmid_val = pmid_match.group(1)
+                
+                # 严格对齐 graph-ec 的打印格式
+                if pmid_val != 'Unknown':
+                    refs_text += f"[{new_idx}] PMID: {pmid_val}\n"
+                else:
+                    refs_text += f"[{new_idx}] URL: {ref.link[:50]}...\n"
+                    
+                refs_text += f"    Title: {title}\n"
+                refs_text += f"    Guidelines: 前沿证据合成 (Deep Research)\n"
+                refs_text += "-" * 10 + "\n"
                 
         return new_content, refs_text
 
     async def _generate_detailed_report(
         self, current_knowledge: str, findings: List[Dict], query: str, iteration: int
     ):
-        """
-        Generate the final report with detailed clinical recommendations.
-        """
         pool_objs = [
-            {"idx": i, "url": r.link, "desc": r.title} 
+            {"idx": self.ref_pool.base_idx + i, "url": r.link, "desc": r.title} 
             for i, r in enumerate(self.ref_pool.pool, 1)
         ]
         pool_json = json.dumps(pool_objs, indent=2)
 
         prompt = textwrap.dedent(f"""
-        你是一名高级临床决策支持系统。请基于提供的【患者病史/拟定方案】和【最新API检索证据】，生成一份详尽的**临床治疗建议书**。
-        
-        ### 患者上下文 (Context)
+        你是一名严谨、克制且经验丰富的肿瘤学多学科会诊（MDT）首席专家。你的任务是基于【初版治疗方案】和【最新检索证据】，撰写一份最终版的术后辅助治疗方案。
+
+        ### 1. 患者真实画像与初版方案 (Original Plan & Context)
         {self.treatment_context}
         
-        ### 2024-Present 最新证据 (Evidence)
+        ### 2. 最新检索证据池 (Raw New Evidence)
         {current_knowledge}
         
-        ### 引用池 (Citation Pool)
+        ### 3. 新增引用池 (New Citation Pool)
         ```json
         {pool_json}
         ```
 
-        ## 任务要求 (Requirements)
-        1. **格式**：严格模仿正规临床病历/Tumor Board报告的后续部分。
-        2. **语言**：简体中文。
-        3. **详细程度**：**非常详细**。不要只写“建议化疗”，必须写出具体方案（如：药物名称、推荐周期数、给药方式）。对于放疗，指明靶区范围。
-        4. **证据支撑**：所有建议必须引用检索到的证据[^^n]。
-        5. **参考文献**：你可以在正文中使用[^^n]，但**不需要**在文末生成Reference列表，系统会自动追加。
+        ## 🛑 临床医疗绝对红线 (CLINICAL RED LINES)
+        1. **绝对证据驱动**：没有检索证据支持，绝对禁止修改初版基础用药！如果你在证据池中看到了经典试验（如证明某药优于初版的毒性药），你必须果断进行优化替换。
+        2. **严格区分治疗阶段**：本患者为**术后辅助治疗阶段（Adjuvant）**。如果证据中的药物是针对“晚期”、“复发”或“转移性”的解救治疗，**绝对禁止**将其加入本方案！
+        3. **拒绝基础实验**：标明是“preclinical”、细胞系或动物模型的证据，**绝对禁止**采纳。
+        4. **前后逻辑一致**：如果你在前面替换了某个药物，在最终的【总结】段落里，必须使用修改后的新药物名称，绝不能自相矛盾！
 
-        ### 输出模版 (Output Template)
-
-        **一、术后辅助治疗建议 (Post-operative Adjuvant Therapy Recommendations)**
-        1. **全身治疗 (Systemic Therapy)**：
-           - *推荐方案*：[详细写出药物，如：紫杉醇 175mg/m² + 卡铂 AUC 5-6]
-           - *周期*：[如：每3周一次，共6个周期]
-           - *依据*：[简述为何选择此方案，引用 ^^n]
-        2. **放射治疗 (Radiation Therapy)**：
-           - *推荐术式*：[如：盆腔外照射 (EBRT) ± 阴道近距离放疗]
-           - *靶区与剂量*：[如：45-50.4 Gy / 25-28 fx]
-           - *争议点说明*：[如：阴道近距离放疗是否必要，引用 ^^n]
-
-        **二、循证医学证据分析 (Evidence-based Rationale)**
-        *结合患者的分子分型（如 p53/MMR 状态）和 FIGO 分期，深入分析为何该方案是2024-2025年的最佳选择。讨论相关的重要临床试验（如 PORTEC-3, GOG-258 等）结果支持。*
-
-        **三、风险评估与管理 (Risk Assessment & Management)**
-        *详细列出可能的不良反应（血液学毒性、神经毒性、消化道反应）及其预防和处理措施。*
-
-        **四、随访计划 (Follow-up Plan)**
-        *列出具体的时间表（如：术后2年内每3个月一次...）及每次随访的必查项目（体格检查、影像学、肿瘤标志物等）。*
+        ## 📝 强制输出结构 (MANDATORY OUTPUT STRUCTURE - CRITICAL)
+        你是一个具备深度思考能力（<think>）的模型。**你必须在内心的思维链中，逐一完成所有证据的采纳与拒绝分析。**
         
-        **五、前沿进展与临床试验 (Emerging Updates & Trials)**
-        *若有适合该患者的入组机会（NCT...）或新药（如免疫检查点抑制剂）的适应症更新，在此列出。*
+        在最终输出时，**你必须直接、且仅仅输出【最终版术后辅助治疗方案】正文！**
+        - ❌ **绝对禁止**输出任何“证据审核记录”、“我拒绝了某某证据”、“采纳/拒绝”等分析过程。
+        - ❌ **绝对禁止**在文末自己编造参考文献列表，只需在正文具体药物后打上保留的 [n] 和新增的 [^^n] 标签。
+        - ✅ 必须采用清晰的 Markdown 标题（如“#### 1. 辅助化疗”）。
+
+        ### ✅ 唯一允许的输出格式范例 (仅供格式参考，严禁抄袭内容):
+        #### 1. 辅助化疗
+        根据高危病理特征，建议进行辅助化疗 [1][2]。
+        - **药物A联合药物B方案**：经典临床试验及最新研究证实，在辅助化疗中药物B的毒性显著低于原方案的药物C，且生存获益无显著差异 [^^12]。因此，建议将初版方案中的药物C优化为药物B（剂量XXX） [^^12]。
+
+        #### 2. 放射治疗
+        ...
         """)
 
         try:
-            # 2. 尝试生成报告正文
             response = await invoke_with_timeout_and_retry(
                 self.report_model, prompt, timeout=1200.0, max_retries=3
             )
             content = remove_think_tags(response.content)
             
-            # 3. ✅ [重排引用] 调用新的重排函数
+            # 调用重排函数：旧标号会被无损保留，新标号会被连续重排
             new_content, refs_section = self._reindex_references(content)
             
             full_report = new_content + refs_section
@@ -439,13 +427,10 @@ class AdvancedSearchSystem:
             
         except Exception as e:
             logger.error(f"Failed to generate report: {e}")
-            
-            # 兜底：列出所有文献，防止数据丢失
-            fallback_refs = "\n\n**六、参考文献 (References)**\n"
-            for i, ref in enumerate(self.ref_pool.pool, 1):
+            fallback_refs = "\n==================================================\n"
+            for i, ref in enumerate(self.ref_pool.pool, self.ref_pool.base_idx + 1):
                 title = ref.title if ref.title else ref.link
-                fallback_refs += f"[{i}] [{title}]({ref.link})\n"
-            
+                fallback_refs += f"[{i}] URL: {ref.link}\n    Title: {title}\n----------\n"
             final_report = f"## 报告生成失败 (Report Generation Failed)\n\n{current_knowledge}\n" + fallback_refs
             return final_report, final_report
 
@@ -494,7 +479,7 @@ class AdvancedSearchSystem:
 
     async def analyze_topic(self, query: str) -> Dict:
         """Main execution loop."""
-        logger.info(f"Starting Pure API Validation for plan length: {len(self.treatment_context)}")
+        logger.info(f"Starting Pure API Validation")
         
         current_knowledge = ""
         iteration = 0
@@ -521,17 +506,7 @@ class AdvancedSearchSystem:
                 if not tool_calls:
                     continue
                 
-                # ✅ [新增] 强制注入 ClinicalTrials 的时间过滤器
-                for call in tool_calls:
-                    if call.get("tool_name") in ["get_studies", "clinicaltrials_search"]:
-                        inputs = call.get("tool_input", {})
-                        original_q = inputs.get("query", "")
-                        # 确保只搜索 2024 年至今有过更新的试验
-                        date_constraint = " AND AREA[LastUpdatePostDate]RANGE[01/01/2024, MAX]"
-                        
-                        if "LastUpdatePostDate" not in original_q:
-                            inputs["query"] = f"{original_q}{date_constraint}"
-                            logger.info(f"Injecting date filter to ClinicalTrials query: {inputs['query']}")
+                # [代码修改点]：此处已彻底删除强制向 ClinicalTrials 注入 "AND AREA[LastUpdatePostDate]RANGE[01/01/2024, MAX]" 时间限制的逻辑，解放系统查阅经典方案的历史文献能力！
 
                 try:
                     tool_results = await self.tool_executor.run(tool_calls) or []
@@ -577,7 +552,7 @@ class AdvancedSearchSystem:
                     citation="",
                     link=ref["url"]
                 )
-                current_knowledge = current_knowledge.replace(ref["url"], f"[{idx}]")
+                current_knowledge = current_knowledge.replace(ref["url"], f"[^^{idx}]")
 
             final_answer = await self._answer_query(
                 current_knowledge, query, iteration, self.max_iterations
@@ -596,12 +571,10 @@ class AdvancedSearchSystem:
                     final_report = str(final_report_tuple)
             except Exception as e:
                 logger.warning(f"Failed to generate detailed report: {e}")
-                
-                # 兜底：列出所有文献，防止数据丢失
-                fallback_refs = "\n\n**六、参考文献 (References)**\n"
-                for i, ref in enumerate(self.ref_pool.pool, 1):
+                fallback_refs = "\n==================================================\n"
+                for i, ref in enumerate(self.ref_pool.pool, self.ref_pool.base_idx + 1):
                     title = ref.title if ref.title else "Source"
-                    fallback_refs += f"[{i}] [{title}]({ref.link})\n"
+                    fallback_refs += f"[{i}] URL: {ref.link}\n    Title: {title}\n----------\n"
                 final_report = current_knowledge + fallback_refs
 
         return {
