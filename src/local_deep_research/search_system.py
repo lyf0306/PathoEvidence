@@ -181,50 +181,56 @@ class AdvancedSearchSystem:
 
     async def _get_follow_up_questions(self, current_knowledge: str, query: str) -> List[str]:
         now = datetime.now().strftime("%Y-%m-%d")
-        
-        patient_profile = self.structured_task.get("patient_profile", "")
-        pathway = self.structured_task.get("primary_pathway", "未提取到主路径")
-        details = "\n".join([f"- {i}" for i in self.structured_task.get("pathway_details", [])])
-        alts = "\n".join([f"- {i}" for i in self.structured_task.get("alternatives_and_exclusions", [])])
-        
-        interventions = f"【主路径 (Primary Pathway)】: {pathway}\n【细节 (Details)】:\n{details}\n【被排除/备选方案 (Excluded/Alternatives)】:\n{alts}"
+        upstream_report = self.treatment_context
         
         prompt = f"""
-        # Clinical Evidence Coordinator & API Planner
+        你是一名顶级的“循证医学检索转化专家”（Clinical Evidence Coordinator）。
+        上游的 RAG 系统生成了一份【初步 MDT 会诊报告】。
+
+        你的核心任务是：
+        1. 【无损提取】：精准理解报告中的“患者全息画像”、“主干治疗方案”及“PICO具体问题”。
+        2. 【🚨 临床方案主动质疑（Clinical Challenge）】：主动审视上游推荐的化疗药物（如顺铂）是否属于毒性较大或已过时的传统药物。如果是，必须生成与现代更优替代药物（如卡铂）的“头对头对比”检索词！
+        3. 【🚨 破解旧文献陷阱（通用时效性策略！）】：当上游要求查询某经典重磅试验（如 PORTEC、GOG 系列）的“最新数据”时，PubMed 通常会把多年前的初版报告排在第一。为了强制召回【任何年限】的最新随访结果，你绝对不能把年份写死（比如不能只写 10-year，因为有些试验可能是 7年或 5年随访），你**必须使用通用的随访关键词簇，并配合年份标签！**
+           - ❌ 错误示范1：PORTEC-3 overall survival (太宽泛，会搜出2018年旧文)
+           - ❌ 错误示范2：PORTEC-3 10-year overall survival (太死板，如果该试验只有5年随访数据就会漏检)
+           - ✅ 正确示范：PORTEC-3 AND ("follow-up"[Title/Abstract] OR "long-term"[Title/Abstract] OR "updated"[Title/Abstract] OR "final"[Title/Abstract]) AND 2020:2026[dp]
+        4. 【转化检索词】：将这些意图转化为能在 PubMed 纯英文数据库中进行精准匹配的高级 Boolean 检索词。
+
+        【上游传入的初步 MDT 会诊报告】：
+        {upstream_report}
         
-        You are an expert Clinical Decision Support Coordinator. 
-        Your task is to analyze a Chinese clinical case, bridge the language gap, and generate precise English API queries for medical databases.
-        
-        ## 1. Clinical Context (Chinese Input)
-        - **Patient Profile**: {patient_profile}
-        - **Proposed Interventions (Baseline Plan)**: {interventions}
-        - **Current Verification Knowledge**: {current_knowledge}
-        
-        ## 2. 🛑 API KEYWORD OPTIMIZATION STRATEGY (CRITICAL)
-        - **Tier 1: Baseline Drug Optimization (Head-to-Head Comparisons)**
-          Identify toxic legacy drugs in the baseline (e.g., Cisplatin). Use your internal medical knowledge to identify its modern, less toxic alternative (e.g., Carboplatin), and generate a pure keyword query putting them side-by-side.
-          *Rule:* Do NOT use complex tags like [ptyp] or [pdat] here. Just use the core keywords so the engine can find landmark Phase III trials (like GOG 209).
-          *GOOD PubMed Query:* "Endometrial cancer Cisplatin Carboplatin"
-        - **Tier 2: Frontier Exploration (Recent 1-2 Years)**
-          Search for new targeted/immunotherapies based on high-risk factors ONLY IF appropriate for the ADJUVANT setting.
-          *Rule:* You MUST add "2024" or "2025" to filter for the latest breakthroughs.
-          *GOOD PubMed Query:* "Endometrial cancer adjuvant Pembrolizumab 2024"
-        
-        Generate exactly {self.questions_per_iteration} highly targeted API queries.
-        
-        ## Output Format (JSON)
+        【当前已验证的知识】：
+        {current_knowledge}
+
+        【🚨 检索词设计红线】：
+        1. 必须使用纯正的英文医学缩写，绝不能用自然语言长句问问题！
+        2. 如果发现了需要质疑的老旧药物，必须生成对比检索词（如：Endometrial cancer Cisplatin Carboplatin efficacy toxicity）。
+        3. 必须精确生成 {self.questions_per_iteration} 个英文检索词组。
+
+        【强制输出 JSON 格式】：
+        你必须输出合法的 JSON 格式。
+        ```json
         {{
-            "analysis": "Identify legacy drugs needing comparison, and new targets for exploration.",
+            "lossless_extraction": {{
+                "patient_status": "极简提炼患者的核心分期、病理、合并症",
+                "proposed_treatment": "无损提取上游推荐的主干方案",
+                "pico_questions": "提取上游在文末留下的具体待查问题"
+            }},
+            "clinical_challenge": "记录药物替换质疑，或对抗旧文献的通用策略（如：我使用了 'follow-up' OR 'updated' 组合词，并加上了近期年份标签，以防止漏检）",
+            "analysis": "结合全局方案、PICO问题和你的主动质疑，简述检索词构建策略。",
             "sub_queries": [
-                "Endometrial cancer Cisplatin Carboplatin", 
-                "Endometrial cancer adjuvant Pembrolizumab 2024"
+                "keyword query 1", 
+                "keyword query 2",
+                "keyword query 3"
             ]
         }}
+        ```
+        💡 请直接输出 JSON 代码块！
         """
 
         try:
             response = await invoke_with_timeout_and_retry(
-                self.reasoning_model, prompt, timeout=1200.0, max_retries=3
+                self.tool_planning_model, prompt, timeout=1200.0, max_retries=3
             )
             
             response_text = remove_think_tags(response.content)
@@ -232,8 +238,12 @@ class AdvancedSearchSystem:
             json_start = response_text.find("{")
             json_end = response_text.rfind("}") + 1
             if json_start != -1 and json_end > json_start:
-                parsed = safe_json_from_text(response_text)
+                parsed = safe_json_from_text(response_text[json_start:json_end])
                 if parsed:
+                    # 打印主动质疑的结果，方便后台监控
+                    challenge = parsed.get("clinical_challenge", "")
+                    logger.info(f"💡 [翻译官临床质询与高级语法控制]: {challenge}")
+                    
                     questions = parsed.get("sub_queries", [])
                     return questions[:self.questions_per_iteration]
             
@@ -242,7 +252,7 @@ class AdvancedSearchSystem:
         except Exception as e:
             logger.warning(f"Failed to generate questions: {e}")
             return []
-
+        
     async def _answer_query(
         self,
         current_knowledge: str,
@@ -374,71 +384,126 @@ class AdvancedSearchSystem:
     async def _generate_detailed_report(
         self, current_knowledge: str, findings: List[Dict], query: str, iteration: int
     ):
-        pool_objs = [
-            {"idx": self.ref_pool.base_idx + i, "url": r.link, "desc": r.title} 
-            for i, r in enumerate(self.ref_pool.pool, 1)
-        ]
-        pool_json = json.dumps(pool_objs, indent=2)
+        # 1. 准备文献标签池
+        pool_text = ""
+        for i, r in enumerate(self.ref_pool.pool, 1):
+            pool_text += f"[^^{self.ref_pool.base_idx + i}] {r.title}\n"
 
-        prompt = textwrap.dedent(f"""
-        你是一名严谨、克制且具备国际视野的肿瘤学多学科会诊（MDT）首席专家。你的任务是基于【基于既有指南的初版方案】和【2024年以后的最新检索证据】，撰写一份最终版的“深度循证”术后辅助治疗方案。
-
-        ### 1. 患者真实画像与指南初版方案 (Original Guideline-based Plan)
-        {self.treatment_context}
-        
-        ### 2. 最新前沿证据池 (Latest Frontier Evidence - 2024+)
+        # =====================================================================
+        # 🤖 智能体 1：临床试验解析专家 (解开字数束缚，恢复长篇深度解析)
+        # =====================================================================
+        trial_prompt = textwrap.dedent(f"""
+        你是一名顶尖的循证医学文献分析专家。请仔细阅读以下【最新查证的前沿循证数据】（均为英文 PubMed 摘要）：
+        ---
         {current_knowledge}
-        
-        ### 3. 新增引用标签池 (New Citation Pool)
-        ```json
-        {pool_json}
-        ```
+        ---
+        文献标签池：
+        {pool_text}
 
-        ## 🛑 证据层级与医疗绝对红线 (EVIDENCE HIERARCHY & RED LINES)
-        1. **【指南与前沿文献的区别】**：初版方案中的文献代表既有的权威指南。新增引用池中的文献代表**最新前沿临床研究（Frontier Clinical Research）**，用来验证、优化或补充指南。
-        2. **【🌟 强制循证引用规则（最核心！）】**：你在正文中提出的任何意见、治疗方案或细节，**必须**标出对应的【真实数字序号】（如使用初版的 `[1]`、`[3]` 或 新增池的 `[^^6]`）。**绝对禁止在输出中直接照抄英文字母 `[x]`！你必须根据上下文，将其替换为真实的阿拉伯数字序号！**
-        3. **【优先整合 2024+ 前沿证据】**：如果发现了适用于该患者的最新权威文献（如新药获益、毒性对比），务必在正文中论述并打上 `[^^数字]`。
-        4. **【允许指南兜底】**：如果没有检索到有价值的新证据，或新证据不适用于该患者，则仅保留初版的指南文献 `[数字]` 即可。
-        5. **【路径排他原则】**：必须给出一条主次分明的综合推荐路径，绝不能将独立的疗法机械叠加。
-
-        ## 📝 强制输出结构 (MANDATORY OUTPUT STRUCTURE - CRITICAL)
-        你必须直接输出【最终版深度循证 MDT 治疗方案】正文！不要输出你的内部思考。严禁自己编造文献列表。
-
-        ### ✅ 必须严格采用以下 5 个模块的 Markdown 结构：
-        
-        ### 1. **MDT 综合辅助决策主路径 (Synthesized MDT Pathway)**
-        （必须首先用一行代码块或高亮粗体表达顶层决策！例如：`全身系统性治疗 (Systemic therapy) ± 盆腔外照射 (EBRT) ± 阴道近距离放疗 (VBT)`）
-
-        ### 2. **各大主流指南 vs. 最新前沿研究 (Guidelines vs. Frontier Evidence)**
-        （这是最重要的循证综述部分。请分两块论述：）
-        - **既有指南共识**：（简述各大指南对该患者的主流共识及分歧点，必须替换为真实的初版文献序号）
-          - **ESGO指南意见**：... [填入真实指南数字序号]
-          - **FIGO指南意见**：... [填入真实指南数字序号]
-          - **NCCN 指南意见**：... [填入真实指南数字序号]
-          - **国内指南意见 (中华医学会妇科肿瘤学分会指南、中国肿瘤整合诊治指南)**：... [填入真实指南数字序号]
-          - **其他指南意见**：... [填入真实指南数字序号]
-        - **最新前沿研究补充**：（基于新增证据池，阐述近年2024+的新试验是否支持或优化了上述方案。**此处必须强制穿插使用 `[^^数字]` 标签**。如无相关新证据，写“当前检索未发现足以改变指南的最新前沿证据”。）
-
-        ### 3. **主路径方案细化与执行细节**
-        （在综合主路径框架下，详述药物选择、剂量、周期。**此处每一项具体推荐的结尾都必须包含真实的文献引用 `[数字]` 或 `[^^数字]`！绝对禁止出现带有字母 x 的 `[x]`！**）
-
-        ### 4. **备选/暂不推荐方案讨论 (Alternatives & Exclusions)**
-        （列出那些因条件不符被明确排除的疗法，明确指出不采纳原因）
-
-        ### 5. **随访计划与注意事项**
-        （整合最新的随访监测证据及不良反应管理，也需附上真实文献引用 `[数字]` 或 `[^^数字]`）
+        【🚨 核心任务与红线】：
+        1. **同类项合并**：必须将同一个试验（如多篇 PORTEC-3 的随访分析）合并在一个大标题下（如 `#### PORTEC-3 试验综合解析`）。绝对禁止用 1.2.3. 给单篇文献编号！
+        2. **打破字数与格式束缚**：不要只写简短的要点！请用长篇大论的专业医学段落，极其详尽地描述该试验的：① 入组人群特征；② 具体干预方案（放化疗剂量等）；③ 精准的生存数据（如 5/10年 OS、DFS 的具体百分比、HR值及P值）；④ 特定分子分型（如 p53abn、MMRd）的获益差异；⑤ 毒性评估。
+        3. **全中文输出**：专业缩写（OS, DFS, HR 等）保留，其余全部翻译为严谨的中文。必须在句尾标上文献角标 [^^x]。
         """)
 
+        logger.info("🤖 [Agent 1] 正在提炼并翻译临床试验数据 (恢复深度长文模式)...")
+        try:
+            trial_res = await invoke_with_timeout_and_retry(self.report_model, trial_prompt, timeout=800.0, max_retries=3)
+            trial_analysis = remove_think_tags(trial_res.content).strip()
+        except Exception:
+            trial_analysis = "临床试验数据解析生成失败，请查阅原始文献。"
+
+        # =====================================================================
+        # 🤖 智能体 2：MDT 首席主笔 (统管全文，确保逻辑一致性与数据强制量化)
+        # =====================================================================
+        main_prompt = textwrap.dedent(f"""
+        你是一名具备顶尖国际视野的妇科肿瘤 MDT 首席专家。
+        【初步会诊草稿】：
+        {self.treatment_context}
+        【助手整理的临床试验深度解析】：
+        {trial_analysis}
+
+        你的任务是：输出最终版的 MDT 报告。
+        
+        ## 🛑 首席专家“元临床思维”法则 (核心红线)
+        1. **【全局用药一致性与纠错】**：比对患者的合并症（高龄、高血压、糖尿病、脑梗等）。如果草稿使用了高毒性老药（如顺铂），你必须在最终方案中将其替换为低毒性现代方案（如卡铂+紫杉醇）。**🚨 极度重要：一旦你决定替换，整篇报告（包括“第一部分：指南分析”和“第二部分：主方案”）都必须统一口径！绝不能在前面说顺铂，后面又说卡铂，绝对不能前后矛盾！**
+        2. **【病理审慎法则】**：若病理信息缺乏关键量化细节（如未写明转移灶大小是 ITC 还是宏转移），必须在【病情分析】末尾添加“💡 临床病理复核建议”。
+        3. **【预后数据强制量化】**：在【预后分析】中，**绝对禁止说空话！**你必须从助手的《临床试验深度解析》中直接提取具体的生存数据（如“根据文献，5年 OS 为 XX%，DFS 为 XX%，HR=X.XX”），结合该患者的高危因素写出极其具体的预后评估！
+        4. **【占位符机制】**：在“3. 核心临床试验循证解析”部分，你只需原封不动地输出 `{{{{TRIAL_PLACEHOLDER}}}}`，不要自己写任何分析内容！
+        5. 绝对不要写参考文献！绝对不要输出 JSON！写完第四部分立刻停止！
+
+        ## 📝 必须使用的固定输出模板（严格照抄格式，填充正文）：
+
+        # 妇科肿瘤 MDT 最终版会诊报告
+
+        ## 一、 病情分析
+        ### 1. 病历及病理摘要
+        （详尽总结患者病情、高危因素及 FIGO 分期）
+        （💡 临床病理复核建议：...）
+
+        ### 2. 各大核心指南推荐及风险分层
+        - **ESGO 2025 风险分层**：...
+        
+        - **ESGO 指南推荐**：
+        `（代码块写出方案，注意：若后续换药，此处的分析也要明确指出倾向于使用低毒性的现代替代方案）`
+        **分析**：...
+        
+        - **NCCN / 其他权威指南推荐**（若证据中有）：
+        `（代码块写出方案）`
+        **分析**：...
+
+        ### 3. 核心临床试验循证解析
+        {{{{TRIAL_PLACEHOLDER}}}}
+
+        ## 二、 术后处理
+        ### 1. 肿瘤专科主方案
+        （明确化疗药物、剂量、放疗靶区。若进行了顺铂换卡铂等操作，必须在此处写“💡 方案优化与纠错说明：阐述结合并发症做出的替换理由”）
+        
+        ### 2. 多学科及合并症管理
+        （必须分点 1. 2. 3. 说明）
+
+        ## 三、 预后分析
+        （🚨 必须带有具体的 OS/DFS 百分比数据、HR值！结合患者高危因素深入讨论，标注文献）
+
+        ## 四、 随访方案
+        （必须分点说明！）
+        - **随访频率**：...
+        - **常规随访内容**：...
+        - **影像学复查原则**：（必须写明：仅在出现临床症状或标志物异常时进行，反对无症状常规 CT/PET-CT）
+        - **可能提示复发的警示症状**：...
+        - **生活方式与心理调整**：...
+        
+        💡 请先在 <think> 标签内思考：我是否统一了前后的用药方案？我是否在预后分析里填入了具体的百分比数据？确认无误后再输出正文！
+        """)
+
+        logger.info("🤖 [Agent 2] 正在统筹生成 MDT 报告主干并确保全局逻辑一致性...")
         try:
             response = await invoke_with_timeout_and_retry(
-                self.report_model, prompt, timeout=1200.0, max_retries=3
+                self.report_model, main_prompt, timeout=1200.0, max_retries=3
             )
             content = remove_think_tags(response.content)
             
-            # 调用重排函数：旧标号会被无损保留，新标号会被连续重排
+            # 强制物理截断防暴走
+            if "## 五" in content: content = content.split("## 五")[0].strip()
+            if "# 五" in content: content = content.split("# 五")[0].strip()
+            if "参考文献" in content: content = content.split("参考文献")[0].strip()
+            if "References" in content: content = content.split("References")[0].strip()
+            
+            # =================================================================
+            # 🔗 拼接占位符
+            # =================================================================
+            if "{{TRIAL_PLACEHOLDER}}" in content:
+                content = content.replace("{{TRIAL_PLACEHOLDER}}", trial_analysis)
+            else:
+                if "## 二、 术后处理" in content:
+                    content = content.replace("## 二、 术后处理", f"### 3. 核心临床试验循证解析\n{trial_analysis}\n\n## 二、 术后处理")
+                else:
+                    content += f"\n\n### 3. 核心临床试验循证解析\n{trial_analysis}"
+
+            # 调用重排函数：旧标号无损保留，新标号连续重排，并在文末自动附上 Ref 列表
             new_content, refs_section = self._reindex_references(content)
             
-            full_report = new_content + refs_section
+            full_report = new_content + "\n" + refs_section
             return full_report, full_report 
             
         except Exception as e:
@@ -447,8 +512,7 @@ class AdvancedSearchSystem:
             for i, ref in enumerate(self.ref_pool.pool, self.ref_pool.base_idx + 1):
                 title = ref.title if ref.title else ref.link
                 fallback_refs += f"[{i}] URL: {ref.link}\n    Title: {title}\n----------\n"
-            final_report = f"## 报告生成失败 (Report Generation Failed)\n\n{current_knowledge}\n" + fallback_refs
-            return final_report, final_report
+            return "报告生成失败", "报告生成失败"
 
     async def _extract_knowledge(self, facts_md: str, refs_in_round: List[Dict]):
         """Extract key info from tool outputs."""
