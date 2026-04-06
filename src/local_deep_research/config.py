@@ -89,7 +89,7 @@ def get_deepseek_v3() -> ChatOpenAI:
         max_tokens=32000,
     )
 
-def get_local_model(temperature: float = 0.6, request_timeout: float = 120.0):
+def get_local_model(temperature: float = 0.1, request_timeout: float = 600.0):
     """
     连接本地 vLLM 部署的模型。
     """
@@ -102,6 +102,6 @@ def get_local_model(temperature: float = 0.6, request_timeout: float = 120.0):
         base_url="http://localhost:8000/v1",
         api_key="EMPTY", 
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=16384,
         request_timeout=request_timeout, # ✅ 允许传递超时时间
     )
